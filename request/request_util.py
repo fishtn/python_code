@@ -193,6 +193,7 @@ class DownloaderMiddleware:
                 self.close_method.appendleft(mw.close)
 
     def download_with_middleware(self, download_func, request):
+        print(request)
         self.process_request(request, self)
         kwargs = request.get_http_kwargs()
         response = download_func(**kwargs)
@@ -300,10 +301,11 @@ class RequestDownloader(Downloader):
                  json=None, session=None, **kwargs):
         _kwargs = locals().copy()
         _kwargs.pop("self")
-        _kwargs.pop("session")
         _kwargs.pop("kwargs")
+        _kwargs.pop("session")
         if not session:
             session = self.default_session
+
         return self._request(session.request, **_kwargs, **kwargs)
 
     @retry()
@@ -313,10 +315,11 @@ class RequestDownloader(Downloader):
 
         _kwargs = locals().copy()
         _kwargs.pop("self")
-        _kwargs.pop("session")
         _kwargs.pop("kwargs")
+        _kwargs.pop("session")
         if not session:
             session = self.default_session
+
         return self.download_with_middleware(self._request, Request(func=session.request, **_kwargs, **kwargs))
 
     async def async_download(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None,
@@ -346,6 +349,21 @@ class HttpxDownloader(Downloader):
         else:
             self.default_session = httpx.Client(verify=False, http2=False, trust_env=False)
 
+    def _httpx_request(self, **kwargs):
+        session = kwargs.pop("session")
+        proxies = kwargs.pop("proxies", None)
+        if proxies:
+            session.proxies = proxies
+        resp = session.request(**kwargs)
+        return Response(
+            url=str(resp.url),
+            content=resp.content,
+            status=resp.status_code,
+            cookies=resp.cookies,
+            headers=resp.headers,
+            history=resp.history
+        )
+
     @retry()
     def get(self, url, headers=None, cookies=None, params=None, allow_redirects=True, timeout=None, auth=None,
             trust_env=False, **kwargs):
@@ -367,9 +385,8 @@ class HttpxDownloader(Downloader):
                  timeout=None, allow_redirects=True, content=None, proxies=None, json=None, session=None, **kwargs):
         _kwargs = locals().copy()
         _kwargs.pop("self")
-        _kwargs.pop("session")
         _kwargs.pop("kwargs")
-        _kwargs.pop("proxies")
+        _kwargs.pop("session")
 
         if proxies:
             if session:
@@ -380,17 +397,18 @@ class HttpxDownloader(Downloader):
 
         if not session:
             session = self.default_session
-
-        return self._request(session.request, **_kwargs, **kwargs)
+        _kwargs["session"] = session
+        return self._httpx_request(**_kwargs, **kwargs)
 
     @retry()
     def fetch(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None, auth=None,
               timeout=None, allow_redirects=True, content=None, proxies=None, json=None, session=None, **kwargs):
         _kwargs = locals().copy()
         _kwargs.pop("self")
-        _kwargs.pop("session")
         _kwargs.pop("kwargs")
         _kwargs.pop("proxies")
+        _kwargs.pop("session")
+
         if proxies:
             if session:
                 session = session.copy()
@@ -400,7 +418,8 @@ class HttpxDownloader(Downloader):
 
         if not session:
             session = self.default_session
-        return self.download_with_middleware(self._request, Request(func=session.request, **_kwargs, **kwargs))
+        _kwargs["session"] = session
+        return self.download_with_middleware(self._httpx_request, Request(**_kwargs, **kwargs))
 
     async def async_download(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None,
                              auth=None, timeout=None, allow_redirects=True, content=None, proxies=None, json=None,
@@ -524,8 +543,8 @@ class AiohttpDownloader(Downloader):
                              data=None, json=None, auth=None, timeout=None, ssl=None, proxy=None, session=None, **kwargs):
         _kwargs = locals().copy()
         _kwargs.pop("self")
-        _kwargs.pop("session")
         _kwargs.pop("kwargs")
+        _kwargs.pop("session")
 
         if not session:
             session = await self.get_session()
@@ -536,10 +555,11 @@ class AiohttpDownloader(Downloader):
                           data=None, json=None, auth=None, timeout=None, ssl=None, proxy=None, session=None, **kwargs):
         _kwargs = locals().copy()
         _kwargs.pop("self")
-        _kwargs.pop("session")
         _kwargs.pop("kwargs")
+        _kwargs.pop("session")
 
         if not session:
             session = await self.get_session()
+
         return await self.async_download_with_middleware(self._request, Request(func=session.request, **_kwargs, **kwargs))
 

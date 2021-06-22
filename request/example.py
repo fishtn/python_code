@@ -1,5 +1,8 @@
 import asyncio
 
+import httpx
+import requests
+
 from request.request_util import RequestDownloader, HttpxDownloader, AiohttpDownloader
 
 
@@ -86,9 +89,28 @@ async def example4():
     print(title)
 
 
+class ProxyMiddleware:
+    def process_request(self, request, download_ins):
+        # proxy = download_ins.get("http://xxxx")
+        proxy = "127.0.0.1:7890"
+        if download_ins.downloader_cls in (requests, httpx):
+            request.proxies = {'https': f"http://{proxy}", 'http': f"http://{proxy}"}
+        else:
+            request.proxy = f"http://{proxy}"
+
+
+def example5():
+    # downloader = AiohttpDownloader(middlewares=[ProxyMiddleware])
+    # downloader = RequestDownloader(middlewares=[ProxyMiddleware])
+    downloader = HttpxDownloader(middlewares=[ProxyMiddleware])
+    response = downloader.download("https://httpbin.org/ip")
+    print(response.json())
+
+
 if __name__ == '__main__':
     # test_all()
     example1()
     example2()
-    example3()
     asyncio.get_event_loop().run_until_complete(example4())
+    example3()
+    example5()
