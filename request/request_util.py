@@ -1,76 +1,47 @@
 import asyncio
+import atexit
 import contextvars
 import functools
-import inspect
+import sys
 import time
-import traceback
 import typing
-from asyncio import iscoroutinefunction
+from asyncio import iscoroutinefunction, events
 
 import codecs
-from collections import deque
 
 import cchardet
 import httpx
 import ujson
 from aiohttp import helpers
-from loguru import logger
 from parsel import Selector
 import aiohttp
 import requests
 from aiohttp import TCPConnector
 
-T = typing.TypeVar("T")
+
+if sys.platform.startswith('win') and sys.version_info >= (3, 8):
+    policy = asyncio.WindowsSelectorEventLoopPolicy()
+    asyncio.set_event_loop_policy(policy)
+
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
 
 
-async def run_in_threadpool(
-    func: typing.Callable[..., T], *args: typing.Any, **kwargs: typing.Any
-) -> T:
-    loop = asyncio.get_event_loop()
-    if contextvars is not None:  # pragma: no cover
-        # Ensure we run in the same context
-        child = functools.partial(func, *args, **kwargs)
-        context = contextvars.copy_context()
-        func = context.run
-        args = (child,)
-    elif kwargs:  # pragma: no cover
-        # loop.run_in_executor doesn't accept 'kwargs', so bind them in here
-        func = functools.partial(func, **kwargs)
-    return await loop.run_in_executor(None, func, *args)
+async def to_thread(func, *args, **kwargs):
+    loop = events.get_running_loop()
+    ctx = contextvars.copy_context()
+    func_call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(None, func_call)
 
 
 async def run_function(callable_fun,  *args, **kwargs) -> typing.Any:
     if iscoroutinefunction(callable_fun):
         return await callable_fun(*args, **kwargs)
     else:
-        return await run_in_threadpool(callable_fun, *args, **kwargs)
-
-
-def retry():
-    def retry_fun(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            download_ins = args[0]
-            while True:
-                try:
-                    response = func(*args, **kwargs)
-                    if response.ok:
-                        return response
-                except:
-                    logger.error(traceback.format_exc())
-
-                retry_times = kwargs.get("retry_times", download_ins.retry_times)
-                retry_delay = kwargs.get("retry_delay", download_ins.retry_delay)
-
-                if retry_times <= 0:
-                    raise Exception("请求错误，重试次数为零")
-
-                kwargs["retry_times"] = retry_times - 1
-
-                time.sleep(retry_delay)
-
-        return wrapper
-    return retry_fun
+        return await to_thread(callable_fun, *args, **kwargs)
 
 
 class Request:
@@ -84,10 +55,7 @@ class Request:
         return f"<{self.method} {self.url}>"
 
     def get_http_kwargs(self):
-        _kwargs = self.__dict__.copy()
-        _kwargs.pop("retry_times", None)
-        _kwargs.pop("retry_delay", None)
-        return _kwargs
+        return self.__dict__.copy()
 
 
 class Response:
@@ -109,7 +77,7 @@ class Response:
         self.history = history
         self.status = status
         self._content = content
-        self.ok = 1 if self.status < 400 else 0
+        self.ok = 1 if self.status < 300 else 0
 
     @property
     def content(self):
@@ -167,83 +135,19 @@ class Response:
         return f"<Response [{self.status}]>"
 
 
-class DownloaderMiddleware:
-    middlewares: list = None
+class RequestDownloader:
+    def __init__(self, session=None, proxy_fun=None):
+        self.downloader_cls = requests
+        self.proxy_fun = proxy_fun
 
-    def __init__(self):
-        # request middleware
-        self.request_middleware = deque()
-        # response middleware
-        self.response_middleware = deque()
-        # close method
-        self.close_method = deque()
+        if session:
+            self.default_session = session
+        else:
+            self.default_session = requests.Session()
+            self.default_session.trust_env = False
 
-    def _load_middleware(self, middlewares):
-        if not middlewares:
-            return
-        for mw_cls in middlewares:
-            mw = mw_cls()
-            if hasattr(mw, "process_request") and callable(getattr(mw, "process_request")):
-                self.request_middleware.append(mw.process_request)
-
-            if hasattr(mw, "process_response") and callable(getattr(mw, "process_response")):
-                self.response_middleware.appendleft(mw.process_response)
-
-            if hasattr(mw, "close") and callable(getattr(mw, "close")):
-                self.close_method.appendleft(mw.close)
-
-    def download_with_middleware(self, download_func, request):
-        print(request)
-        self.process_request(request, self)
-        kwargs = request.get_http_kwargs()
-        response = download_func(**kwargs)
-        self.process_response(request, response, self)
-        return response
-
-    async def async_download_with_middleware(self, download_func, request):
-        await run_function(self.process_request, request, self)
-        kwargs = request.get_http_kwargs()
-        response = await download_func(**kwargs)
-        await run_function(self.process_response, request, response, self)
-        return response
-
-    def process_request(self, request: Request, download_ins):
-        for middleware in self.request_middleware:
-            try:
-                middleware(request, download_ins)
-            except Exception as e:
-                logger.error(f"<Middleware {middleware.__name__}: {e} \n{traceback.format_exc()}>")
-
-    def process_response(self, request: Request, response: Response, download_ins):
-        for middleware in self.response_middleware:
-            try:
-                middleware(request, response, download_ins)
-            except Exception as e:
-                logger.error(f"<Middleware {middleware.__name__}: {e} \n{traceback.format_exc()}>")
-
-    def close(self):
-        for func in self.close_method:
-            func()
-
-
-class Downloader(DownloaderMiddleware):
-    default_session = None
-    downloader_cls = None
-
-    def __init__(self, middlewares, retry_times, retry_delay):
-        super().__init__()
-        self.retry_times = retry_times
-        self.retry_delay = retry_delay
-        self._load_middleware(middlewares)
-
-    def __del__(self):
-        self.close()
-
-    def close(self):
-        super().close()
-
-    def _request(self, func, **kwargs):
-        resp = func(**kwargs)
+    @staticmethod
+    def get_response(resp):
         return Response(
             url=str(resp.url),
             content=resp.content,
@@ -253,62 +157,16 @@ class Downloader(DownloaderMiddleware):
             history=resp.history
         )
 
-    def get(self, *args, **kwargs):
-        pass
+    @staticmethod
+    def get_kwargs(kwargs):
+        kwargs.pop("session", None)
+        _kwargs = kwargs.pop("kwargs")
 
-    def post(self, *args, **kwargs):
-        pass
+        new_kwargs = {**kwargs, **_kwargs}
+        new_kwargs.pop("self")
+        new_kwargs.pop("session", None)
+        return new_kwargs
 
-    async def async_get(self, url, headers=None, cookies=None, params=None, allow_redirects=True, verify=None, **kwargs):
-        return await run_function(self.get, url=url, headers=headers, cookies=cookies, params=params,
-                                  allow_redirects=allow_redirects, verify=verify, **kwargs)
-
-    async def async_post(self, url, headers=None, cookies=None, params=None, data=None, json=None, allow_redirects=True,
-                         verify=None, **kwargs):
-        return await run_function(self.post, url=url, headers=headers, cookies=cookies, params=params, data=data,
-                                  json=json, allow_redirects=allow_redirects, verify=verify, **kwargs)
-
-
-class RequestDownloader(Downloader):
-    def __init__(self, session=None, middlewares=None, retry_times=3, retry_delay=3):
-        super().__init__(middlewares, retry_times, retry_delay)
-        self.downloader_cls = requests
-
-        if session:
-            self.default_session = session
-        else:
-            self.default_session = requests.Session()
-            self.default_session.trust_env = False
-
-    @retry()
-    def get(self, url, headers=None, cookies=None, params=None, allow_redirects=True, verify=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self._request(requests.get, **_kwargs, **kwargs)
-
-    @retry()
-    def post(self, url, headers=None, cookies=None, allow_redirects=True, params=None, data=None, json=None,
-             verify=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self._request(requests.post, **_kwargs, **kwargs)
-
-    @retry()
-    def download(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None, auth=None,
-                 timeout=None, allow_redirects=True, proxies=None, hooks=None, stream=None, verify=None, cert=None,
-                 json=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        _kwargs.pop("session")
-        if not session:
-            session = self.default_session
-
-        return self._request(session.request, **_kwargs, **kwargs)
-
-    @retry()
     def fetch(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None, auth=None,
               timeout=None, allow_redirects=True, proxies=None, hooks=None, stream=None, verify=None, cert=None,
               json=None, session=None, **kwargs):
@@ -320,15 +178,8 @@ class RequestDownloader(Downloader):
         if not session:
             session = self.default_session
 
-        return self.download_with_middleware(self._request, Request(func=session.request, **_kwargs, **kwargs))
-
-    async def async_download(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None,
-                             auth=None, timeout=None, allow_redirects=True, proxies=None, hooks=None, stream=None,
-                             verify=None, cert=None, json=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return await run_function(self.download, **_kwargs, **kwargs)
+        resp = session.request(**_kwargs)
+        return self.get_response(resp)
 
     async def async_fetch(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None,
                           auth=None, timeout=None, allow_redirects=True, proxies=None, hooks=None, stream=None,
@@ -339,22 +190,35 @@ class RequestDownloader(Downloader):
         return await run_function(self.fetch, **_kwargs, **kwargs)
 
 
-class HttpxDownloader(Downloader):
-    def __init__(self, session=None, middlewares=None, retry_times=3, retry_delay=3):
-        super().__init__(middlewares, retry_times, retry_delay)
+class HttpxDownloader:
+    def __init__(self, session=None, proxy_fun=None, loop=None):
         self.downloader_cls = httpx
+
+        self.proxy_fun = proxy_fun
 
         if session:
             self.default_session = session
         else:
             self.default_session = httpx.Client(verify=False, http2=False, trust_env=False)
+            self.default_async_session = httpx.AsyncClient(verify=False, http2=False, trust_env=False)
 
-    def _httpx_request(self, **kwargs):
-        session = kwargs.pop("session")
-        proxies = kwargs.pop("proxies", None)
-        if proxies:
-            session.proxies = proxies
-        resp = session.request(**kwargs)
+        self.loop = loop if loop else asyncio.get_event_loop()
+
+        atexit.register(self.close)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def run_in_async(self, func, *args, **kwargs):
+        return self.loop.run_until_complete(func(*args, **kwargs))
+
+    def close(self):
+        if self.default_session:
+            self.default_session.close()
+            self.run_in_async(self.default_async_session.aclose)
+
+    @staticmethod
+    def get_response(resp):
         return Response(
             url=str(resp.url),
             content=resp.content,
@@ -364,110 +228,70 @@ class HttpxDownloader(Downloader):
             history=resp.history
         )
 
-    @retry()
-    def get(self, url, headers=None, cookies=None, params=None, allow_redirects=True, timeout=None, auth=None,
-            trust_env=False, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self._request(httpx.get, **_kwargs, **kwargs)
+    @staticmethod
+    def get_kwargs(kwargs):
+        kwargs.pop("session", None)
+        _kwargs = kwargs.pop("kwargs")
 
-    @retry()
-    def post(self, url, headers=None, cookies=None, allow_redirects=True, content=None, params=None, data=None,
-             files=None, json=None, auth=None, timeout=None, trust_env=False, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self._request(httpx.post, **_kwargs, **kwargs)
+        new_kwargs = {**kwargs, **_kwargs}
+        new_kwargs.pop("self")
+        new_kwargs.pop("session", None)
+        new_kwargs.pop("proxies", None)
+        return new_kwargs
 
-    @retry()
-    def download(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None, auth=None,
-                 timeout=None, allow_redirects=True, content=None, proxies=None, json=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        _kwargs.pop("session")
-
-        if proxies:
-            if session:
-                session = session.copy()
-                session.proxies = proxies
-            else:
-                session = httpx.Client(verify=False, http2=False, proxies=proxies)
-
-        if not session:
-            session = self.default_session
-        _kwargs["session"] = session
-        return self._httpx_request(**_kwargs, **kwargs)
-
-    @retry()
     def fetch(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None, auth=None,
               timeout=None, allow_redirects=True, content=None, proxies=None, json=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        _kwargs.pop("proxies")
-        _kwargs.pop("session")
-
-        if proxies:
-            if session:
-                session = session.copy()
-                session.proxies = proxies
-            else:
-                session = httpx.Client(verify=False, http2=False, proxies=proxies)
+        _kwargs = self.get_kwargs(locals().copy())
 
         if not session:
             session = self.default_session
-        _kwargs["session"] = session
-        return self.download_with_middleware(self._httpx_request, Request(**_kwargs, **kwargs))
 
-    async def async_download(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None,
-                             auth=None, timeout=None, allow_redirects=True, content=None, proxies=None, json=None,
-                             session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
+        if proxies:
+            session.proxies = proxies
+        else:
+            session.proxies = {"https": None, "http": None}
 
-        return await run_function(self.download, **_kwargs, **kwargs)
+        resp = session.request(**kwargs)
+        return self.get_response(resp)
 
     async def async_fetch(self, url, method="GET", params=None, data=None, headers=None, cookies=None, files=None,
                           auth=None, timeout=None, allow_redirects=True, content=None, proxies=None, json=None,
                           session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return await run_function(self.fetch, **_kwargs, **kwargs)
+        _kwargs = self.get_kwargs(locals().copy())
+
+        if not session:
+            session = self.default_async_session
+
+        if proxies is not None:
+            session.proxies = proxies
+        else:
+            if self.proxy_fun:
+                session.proxies = await run_function(self.proxy_fun)
+            else:
+                session.proxies = {"https": None, "http": None}
+
+        resp = await session.request(**_kwargs)
+        return self.get_response(resp)
 
 
-class AiohttpDownloader(Downloader):
-    def __init__(self, session=None, middlewares=None, retry_times=3, retry_delay=3, loop=None):
-        super().__init__(middlewares, retry_times, retry_delay)
+class AiohttpDownloader:
+    def __init__(self, session=None, proxy_fun=None, loop=None):
         self.downloader_cls = aiohttp
         self.tc = None
-        self.loop = loop if loop else asyncio.get_event_loop()
+
         if session:
             self.default_session = session
-
-    def run_in_async(self, func, **kwargs):
-        return self.loop.run_until_complete(func(**kwargs))
-
-    async def get_session(self):
-        if self.default_session:
-            return self.default_session
         else:
-            jar = aiohttp.DummyCookieJar()
-            self.tc = TCPConnector(limit=0, force_close=True, enable_cleanup_closed=True, ssl=False)
-            self.default_session = aiohttp.ClientSession(connector=self.tc, cookie_jar=jar)
-            return self.default_session
+            self.default_session = None
 
-    def close(self):
-        super(AiohttpDownloader, self).close()
-        if self.default_session:
-            self.run_in_async(self.default_session.close)
-            self.tc.close()
+        self.proxy_fun = proxy_fun
 
-    async def _request(self, func, **kwargs):
-        resp = await func(**kwargs)
+        self.loop = loop if loop else asyncio.get_event_loop()
+
+        atexit.register(self.close)
+
+    @staticmethod
+    async def get_response(resp):
         return Response(
             url=str(resp.url),
             content=await resp.read(),
@@ -477,89 +301,50 @@ class AiohttpDownloader(Downloader):
             history=resp.history,
         )
 
-    async def async_get(self, url, headers=None, cookies=None, params=None, allow_redirects=True, ssl=None, proxy=None,
-                        **kwargs):
-        async with aiohttp.ClientSession() as client:
-            async with client.request(method='GET', url=url, headers=headers, cookies=cookies, params=params,
-                                      allow_redirects=allow_redirects, proxy=proxy, ssl=ssl, **kwargs) as resp:
-                response = Response(
-                    url=str(resp.url),
-                    content=await resp.read(),
-                    status=resp.status,
-                    cookies=resp.cookies,
-                    headers=resp.headers,
-                    history=resp.history,
-                )
-                return response
+    def run_in_async(self, func, *args, **kwargs):
+        return self.loop.run_until_complete(func(*args, **kwargs))
 
-    async def async_post(self, url, headers=None, cookies=None, allow_redirects=True, params=None,
-                         data=None, json=None, auth=None, timeout=None, ssl=None, proxy=None, **kwargs):
-        async with aiohttp.ClientSession() as client:
-            async with client.request(method='POST', url=url, headers=headers, cookies=cookies, ssl=ssl, proxy=proxy,
-                                      auth=auth, allow_redirects=allow_redirects, params=params, data=data, json=json,
-                                      **kwargs) as resp:
-                response = Response(
-                    url=str(resp.url),
-                    content=await resp.read(),
-                    status=resp.status,
-                    cookies=resp.cookies,
-                    headers=resp.headers,
-                    history=resp.history,
-                )
-                return response
+    @staticmethod
+    def get_kwargs(kwargs):
+        kwargs.pop("session", None)
+        _kwargs = kwargs.pop("kwargs")
 
-    @retry()
-    def get(self, url, headers=None, cookies=None, params=None, allow_redirects=True, ssl=None, proxy=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self.run_in_async(self.async_get, **_kwargs, **kwargs)
+        new_kwargs = {**kwargs, **_kwargs}
+        new_kwargs.pop("self")
+        new_kwargs.pop("session", None)
+        return new_kwargs
 
-    @retry()
-    def post(self, url, headers=None, cookies=None, allow_redirects=True, params=None, data=None,
-             json=None, auth=None, timeout=None, ssl=None, proxy=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self.run_in_async(self.async_post, **_kwargs, **kwargs)
+    async def get_session(self):
+        if self.default_session:
+            return self.default_session
+        else:
+            jar = aiohttp.DummyCookieJar()
+            self.tc = TCPConnector(limit=1000, force_close=True, enable_cleanup_closed=True, ssl=False)
+            self.default_session = aiohttp.ClientSession(connector=self.tc, cookie_jar=jar)
+            return self.default_session
 
-    @retry()
-    def download(self, url, method="GET", headers=None, cookies=None, allow_redirects=True, params=None, data=None,
-                 json=None, auth=None, timeout=None, ssl=None, proxy=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self.run_in_async(self.async_download, **_kwargs, **kwargs)
+    def close(self):
+        if self.default_session:
+            self.run_in_async(self.default_session.close)
+            self.tc.close()
 
-    @retry()
     def fetch(self, url, method="GET", headers=None, cookies=None, allow_redirects=True, params=None, data=None,
               json=None, auth=None, timeout=None, ssl=None, proxy=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        return self.run_in_async(self.async_fetch, **_kwargs, **kwargs)
-
-    async def async_download(self, url, method="GET", headers=None, cookies=None, allow_redirects=True, params=None,
-                             data=None, json=None, auth=None, timeout=None, ssl=None, proxy=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        _kwargs.pop("session")
-
-        if not session:
-            session = await self.get_session()
-
-        return await self._request(session.request, **_kwargs, **kwargs)
+        _kwargs = self.get_kwargs(locals().copy())
+        return self.run_in_async(self.async_fetch, **_kwargs)
 
     async def async_fetch(self, url, method="GET", headers=None, cookies=None, allow_redirects=True, params=None,
                           data=None, json=None, auth=None, timeout=None, ssl=None, proxy=None, session=None, **kwargs):
-        _kwargs = locals().copy()
-        _kwargs.pop("self")
-        _kwargs.pop("kwargs")
-        _kwargs.pop("session")
+        _kwargs = self.get_kwargs(locals().copy())
 
         if not session:
             session = await self.get_session()
 
-        return await self.async_download_with_middleware(self._request, Request(func=session.request, **_kwargs, **kwargs))
+        if proxy is not None and self.proxy_fun:
+            _kwargs["proxy"] = await run_function(self.proxy_fun)
+
+        async with aiohttp.ClientSession() as client:
+            async with client.request(**_kwargs) as resp:
+                return await self.get_response(resp)
+
 
